@@ -1,40 +1,46 @@
 #include "chan.hpp"
-#include <cassert>
 #include <chrono>
+#include <ctime>
+#include <iostream>
+#include <string>
 #include <thread>
+using namespace channel;
 
-static constexpr int size = 128;
+static constexpr int size = 16;
 
-void worker(chan::sender<int> &channel, chan::receiver<bool> &quit) {
-    for (int m = 0; m < size; ++m) {
-        std::thread th(
-            [&](int m) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(m));
-                channel << m;
-            },
-            m);
-        th.detach();
-    }
+void worker(int i, sender<int> &channel, sender<std::string> &logger, receiver<bool> &quit) {
+    auto m = 1 << i;
+    channel << m;
+    logger << "send " + std::to_string(m);
     quit.receive();
-    channel.close();
+    logger << "worker " + std::to_string(i) + " exit";
 }
 
 int main() {
-    chan::chan<int> channel;
-    chan::chan<bool> quit;
-    std::thread th(worker, std::ref(channel), std::ref(quit));
-    th.detach();
+    chan<int> channel(4);
+    chan<std::string> logger;
+    chan<bool> quit;
+    for (int i = 1; i <= size; ++i) {
+        std::thread th(worker, i, std::ref(channel), std::ref(logger), std::ref(quit));
+        th.detach();
+    }
 
-    bool box[size] = {false};
-    auto rest = size;
-    auto timer = chan::timer(std::chrono::seconds(2));
-    for (auto [m, t] : chan::chans<int, chan::time_point>(channel, *timer))
-        if (m) {
-            int &msg = *m;
-            assert(msg >= 0 && msg < size && !box[msg]);
-            box[msg] = true;
-            if (!--rest)
-                quit << true;
+    auto logs = size * 3;
+    auto tm = timer(std::chrono::seconds(4));
+    for (auto [msg, log, t] : select<int, std::string, time_point>(channel, logger, *tm))
+        if (msg) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(400));
+            logger << "receive " + std::to_string(*msg);
+            quit << true;
+        } else if (log) {
+            std::cout << *log << std::endl;
+            if (!--logs) {
+                channel.close();
+                logger.close();
+            }
+        } else if (t) {
+            auto time = std::chrono::system_clock::to_time_t(*t);
+            std::cout << "current time: " << std::ctime(&time);
         }
 
     return 0;

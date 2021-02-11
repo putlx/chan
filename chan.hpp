@@ -3,6 +3,7 @@
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -10,42 +11,42 @@
 #include <thread>
 #include <tuple>
 
-namespace chan {
+namespace channel {
 
 template <typename T> class basic_chan {
   public:
-    using element_type = T;
-
     basic_chan() = default;
 
-    basic_chan(const basic_chan<T> &) = delete;
-
-    basic_chan<T> &operator=(const basic_chan &) = delete;
+    explicit basic_chan(std::size_t capacity) : capacity(capacity){};
 
     virtual void close() {
         closed.store(true);
-        cv.notify_all();
+        consume.notify_all();
     }
 
     virtual bool is_open() const { return !closed.load(); }
 
   protected:
+    std::size_t capacity = std::numeric_limits<std::size_t>::max();
     std::atomic<bool> closed;
     std::queue<T> queue;
     std::mutex mutex;
-    std::condition_variable_any cv;
+    std::condition_variable produce;
+    std::condition_variable consume;
 };
 
 template <typename T> class sender : virtual public basic_chan<T> {
   public:
+    sender() = default;
+
+    explicit sender(std::size_t capacity) : basic_chan<T>(capacity){};
+
     void send(const T &value) {
-        if (this->closed.load())
+        if (!this->is_open())
             throw std::runtime_error("send on closed channel");
-        {
-            std::lock_guard<std::mutex> lock(this->mutex);
-            this->queue.push(value);
-        }
-        this->cv.notify_one();
+        std::unique_lock<std::mutex> lock(this->mutex);
+        this->produce.wait(lock, [this] { return this->queue.size() < this->capacity; });
+        this->queue.push(value);
     }
 
     sender<T> &operator<<(const T &value) {
@@ -56,11 +57,11 @@ template <typename T> class sender : virtual public basic_chan<T> {
 
 template <typename T> class receiver : virtual public basic_chan<T> {
   private:
-    template <typename U> class box {
+    template <typename U> class iterator {
       public:
-        box(receiver<U> &recver) : recver(recver), value(recver.receive()) {}
+        iterator(receiver<U> &channel) : channel(channel), value(channel.receive()) {}
 
-        box(receiver<U> &recver, std::nullptr_t) : recver(recver) {}
+        iterator(receiver<U> &channel, std::nullptr_t) : channel(channel) {}
 
         U &operator*() {
             if (!value)
@@ -68,58 +69,70 @@ template <typename T> class receiver : virtual public basic_chan<T> {
             return *value;
         }
 
-        box<U> &operator++() {
-            value = recver.receive();
+        iterator<U> &operator++() {
+            value = channel.receive();
             return *this;
         }
 
-        bool operator!=(const box<U> &bx) const {
-            return !(&recver == &bx.recver && !value && !bx.value);
+        bool operator!=(const iterator<U> &it) const {
+            return !(&channel == &it.channel && !value && !it.value);
         }
 
       protected:
-        receiver<U> &recver;
+        receiver<U> &channel;
         std::unique_ptr<U> value;
     };
 
   public:
-    std::unique_ptr<T> receive() {
-        std::unique_lock<std::mutex> lock(this->mutex);
-        this->cv.wait(lock, [this] { return !this->queue.empty() || this->closed.load(); });
-        if (this->queue.empty())
-            return std::unique_ptr<T>();
-        std::unique_ptr<T> value(new T(std::move_if_noexcept(this->queue.front())));
-        this->queue.pop();
-        return value;
-    }
+    receiver() = default;
 
-    std::unique_ptr<T> try_receive() {
+    explicit receiver(std::size_t capacity) : basic_chan<T>(capacity){};
+
+    std::unique_ptr<T> receive() {
         std::lock_guard<std::mutex> lock(this->mutex);
         if (this->queue.empty())
             return std::unique_ptr<T>();
         std::unique_ptr<T> value(new T(std::move_if_noexcept(this->queue.front())));
         this->queue.pop();
+        this->produce.notify_one();
+        return value;
+    }
+
+    std::unique_ptr<T> try_receive() {
+        std::unique_ptr<T> value;
+        std::lock_guard<std::mutex> lock(this->mutex);
+        if (this->queue.empty())
+            return value;
+        value.reset(new T(std::move_if_noexcept(this->queue.front())));
+        this->queue.pop();
+        this->produce.notify_one();
         return value;
     }
 
     bool operator>>(T &value) {
         std::unique_lock<std::mutex> lock(this->mutex);
-        this->cv.wait(lock, [this] { return !this->queue.empty() || this->closed.load(); });
+        this->consume.wait(lock, [this] { return !this->queue.empty() || !this->is_open(); });
         if (this->queue.empty())
             return false;
         value = std::move_if_noexcept(this->queue.front());
         this->queue.pop();
+        this->produce.notify_one();
         return true;
     }
 
-    box<T> begin() { return box<T>(*this); }
+    iterator<T> begin() { return iterator<T>(*this); }
 
-    box<T> end() { return box<T>(*this, nullptr); }
+    iterator<T> end() { return iterator<T>(*this, nullptr); }
 };
 
-template <typename T> class chan : virtual public sender<T>, virtual public receiver<T> {};
+template <typename T> class chan : virtual public sender<T>, virtual public receiver<T> {
+  public:
+    chan() = default;
 
-template <typename... Ts> class chans {
+    explicit chan(std::size_t capacity) : basic_chan<T>(capacity){};
+};
+
+template <typename... Ts> class select {
   private:
     template <size_t N> struct visit_impl {
         template <typename T, typename U, typename F>
@@ -138,18 +151,14 @@ template <typename... Ts> class chans {
         }
     };
 
-    template <typename... Us> class selector {
+    template <typename... Us> class iterator {
       public:
-        selector(const std::tuple<receiver<Us> *...> &channels, bool nullable)
+        iterator(const std::tuple<receiver<Us> *...> &channels, bool nullable)
             : channels(channels), nullable(nullable), dist(0, sizeof...(Us) - 1) {
             ++*this;
         }
 
-        selector(const selector<Us...> &) = delete;
-
-        selector<Us...> &operator=(const selector<Us...> &) = delete;
-
-        selector<Us...> &operator++() {
+        iterator<Us...> &operator++() {
             std::size_t i, not_visited = sizeof...(Us);
             bool visited[sizeof...(Us)] = {false};
             bool received;
@@ -193,12 +202,12 @@ template <typename... Ts> class chans {
     bool nullable;
 
   public:
-    chans(receiver<Ts> &...channels, bool nullable = false)
+    select(receiver<Ts> &...channels, bool nullable = false)
         : channels(std::make_tuple(&channels...)), nullable(nullable) {}
 
-    selector<Ts...> begin() { return selector<Ts...>(channels, nullable); }
+    iterator<Ts...> begin() { return iterator<Ts...>(channels, nullable); }
 
-    static std::nullptr_t end() { return nullptr; }
+    std::nullptr_t end() { return nullptr; }
 };
 
 typedef std::chrono::time_point<std::chrono::system_clock> time_point;
@@ -232,4 +241,4 @@ std::shared_ptr<receiver<time_point>> ticker(const std::chrono::duration<T, U> &
     return std::move(channel);
 }
 
-} // namespace chan
+} // namespace channel
