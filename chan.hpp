@@ -3,6 +3,7 @@
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -11,6 +12,7 @@
 #include <random>
 #include <thread>
 #include <tuple>
+#include <utility>
 
 namespace channel {
 
@@ -20,8 +22,8 @@ template <typename T> struct entity {
     std::queue<T> queue;
     std::mutex mutex;
     std::mutex shared_ptr_mutex;
-    std::condition_variable produce;
-    std::condition_variable consume;
+    std::condition_variable producers;
+    std::condition_variable consumers;
 };
 
 template <typename T> class basic_chan {
@@ -56,13 +58,18 @@ template <typename T> class basic_chan {
 
     virtual void close() {
         e->closed.store(true);
-        e->consume.notify_all();
+        e->consumers.notify_all();
     }
 
     virtual bool is_open() const { return !e->closed.load(); }
 
   protected:
     std::shared_ptr<entity<T>> e;
+};
+
+class channel_error : public std::runtime_error {
+  public:
+    channel_error(const char *what_arg) : std::runtime_error(what_arg) {}
 };
 
 template <typename T> class sender : virtual public basic_chan<T> {
@@ -81,11 +88,12 @@ template <typename T> class sender : virtual public basic_chan<T> {
 
     void send(const T &value) {
         if (!this->is_open())
-            throw std::runtime_error("send on closed channel");
+            throw channel_error("send on closed channel");
         std::unique_lock<std::mutex> lock(this->e->mutex);
-        this->e->produce.wait(lock, [this] { return this->e->queue.size() < this->e->capacity; });
+        this->e->producers.wait(lock,
+                                [this] { return this->e->queue.size() < this->e->capacity; });
         this->e->queue.push(value);
-        this->e->consume.notify_one();
+        this->e->consumers.notify_one();
     }
 
     sender<T> &operator<<(const T &value) {
@@ -104,7 +112,7 @@ template <typename T> class receiver : virtual public basic_chan<T> {
 
         U &operator*() {
             if (!value)
-                throw std::runtime_error("receive on empty closed channel");
+                throw channel_error("receive on empty closed channel");
             return *value;
         }
 
@@ -135,13 +143,13 @@ template <typename T> class receiver : virtual public basic_chan<T> {
 
     std::optional<T> receive() {
         std::unique_lock<std::mutex> lock(this->e->mutex);
-        this->e->consume.wait(lock,
-                              [this] { return !this->e->queue.empty() || !this->is_open(); });
+        this->e->consumers.wait(lock,
+                                [this] { return !this->e->queue.empty() || !this->is_open(); });
         if (this->e->queue.empty())
             return std::optional<T>();
         std::optional<T> value(std::in_place, std::move_if_noexcept(this->e->queue.front()));
         this->e->queue.pop();
-        this->e->produce.notify_one();
+        this->e->producers.notify_one();
         return value;
     }
 
@@ -151,19 +159,19 @@ template <typename T> class receiver : virtual public basic_chan<T> {
             return std::optional<T>();
         std::optional<T> value(std::in_place, std::move_if_noexcept(this->e->queue.front()));
         this->e->queue.pop();
-        this->e->produce.notify_one();
+        this->e->producers.notify_one();
         return value;
     }
 
     bool operator>>(T &value) {
         std::unique_lock<std::mutex> lock(this->e->mutex);
-        this->e->consume.wait(lock,
-                              [this] { return !this->e->queue.empty() || !this->is_open(); });
+        this->e->consumers.wait(lock,
+                                [this] { return !this->e->queue.empty() || !this->is_open(); });
         if (this->e->queue.empty())
             return false;
         value = std::move_if_noexcept(this->e->queue.front());
         this->e->queue.pop();
-        this->e->produce.notify_one();
+        this->e->producers.notify_one();
         return true;
     }
 
@@ -179,93 +187,64 @@ template <typename T> class chan : virtual public sender<T>, virtual public rece
     explicit chan(std::size_t capacity) : basic_chan<T>(capacity){};
 };
 
-template <typename... Ts> class select {
-  private:
-    // reference: https://stackoverflow.com/a/28998020
-    template <size_t N> struct visit_impl {
-        template <typename T, typename U, typename F>
-        static void visit(T &x, U &y, size_t idx, const F func) {
-            if (idx == N - 1)
-                func(std::get<N - 1>(x), std::get<N - 1>(y));
-            else
-                visit_impl<N - 1>::visit(x, y, idx, func);
-        }
-    };
-
-    template <> struct visit_impl<0> {
-        template <typename T, typename U, typename F>
-        static void visit(T &, U &, size_t, const F) {
-            assert(false);
-        }
-    };
-
-    template <typename... Us> class iterator {
-      public:
-        iterator(const std::tuple<receiver<Us>...> &chans, bool nullable)
-            : chans(chans), nullable(nullable), dist(0, sizeof...(Us) - 1) {
-            ++*this;
-        }
-
-        iterator<Us...> &operator++() {
-            stage = std::tuple<std::optional<Us>...>();
-            std::size_t idx;
-            std::size_t not_visited = sizeof...(Us);
-            bool visited[sizeof...(Us)] = {false};
-            bool received;
-            do {
-                do {
-                    idx = dist(rd);
-                } while (is_closed[idx]);
-                visit_impl<sizeof...(Us)>::visit(stage, chans, idx,
-                                                 [&, this](auto &stg, auto &receiver) {
-                                                     stg = receiver.try_receive();
-                                                     received = bool(stg);
-                                                     if (!received) {
-                                                         if (this->nullable) {
-                                                             if (!visited[idx]) {
-                                                                 visited[idx] = true;
-                                                                 --not_visited;
-                                                             }
-                                                         } else if (!receiver.is_open()) {
-                                                             this->is_closed[idx] = true;
-                                                             --this->opened;
-                                                         }
-                                                     }
-                                                 });
-            } while (!received && opened > 0 && (!nullable || not_visited));
-            return *this;
-        }
-
-        std::tuple<std::optional<Us>...> operator*() { return std::move_if_noexcept(stage); }
-
-        bool operator!=(std::nullptr_t) const { return opened > 0; }
-
-      private:
-        std::tuple<receiver<Us>...> chans;
-        bool nullable;
-        std::tuple<std::optional<Us>...> stage;
-        bool is_closed[sizeof...(Us)] = {false};
-        std::size_t opened = sizeof...(Us);
-        std::random_device rd;
-        std::uniform_int_distribution<std::size_t> dist;
-    };
-
-    std::tuple<receiver<Ts>...> chans;
-    bool nullable;
-
-  public:
-    select(const receiver<Ts> &...chans, bool nullable = false)
-        : chans(std::make_tuple(chans...)), nullable(nullable) {}
-
-    iterator<Ts...> begin() { return iterator<Ts...>(chans, nullable); }
-
-    std::nullptr_t end() { return nullptr; }
+// reference: https://stackoverflow.com/a/28998020
+template <size_t N> struct visit_impl {
+    template <typename T, typename F> static void visit(T &tup, size_t idx, F func) {
+        if (idx == N - 1)
+            func(std::get<N - 1>(tup));
+        else
+            visit_impl<N - 1>::visit(tup, idx, func);
+    }
 };
+
+template <> struct visit_impl<0> {
+    template <typename T, typename F> static void visit(T &, size_t, F) { assert(false); }
+};
+
+template <typename... Ts>
+void select(std::pair<receiver<Ts>, std::function<bool(Ts)>>... rfs,
+            std::function<bool(void)> f = std::function<bool(void)>()) {
+    auto rft = std::make_tuple(rfs...);
+    std::random_device rd;
+    std::uniform_int_distribution<std::size_t> dist(0, sizeof...(Ts) - 1);
+    bool closed[sizeof...(Ts)] = {false};
+    std::size_t not_closed = sizeof...(Ts);
+
+    for (bool ctn = true; ctn && not_closed > 0;) {
+        bool visited[sizeof...(Ts)] = {false};
+        std::size_t not_visited = sizeof...(Ts);
+        std::size_t idx;
+        bool received;
+        do {
+            do {
+                idx = dist(rd);
+            } while (closed[idx]);
+            visit_impl<sizeof...(Ts)>::visit(rft, idx, [&](auto &rf) {
+                auto stage = rf.first.try_receive();
+                received = bool(stage);
+                if (received) {
+                    ctn = rf.second(std::move_if_noexcept(*stage));
+                    return;
+                }
+                if (f && !visited[idx]) {
+                    visited[idx] = true;
+                    --not_visited;
+                }
+                if (!rf.first.is_open()) {
+                    closed[idx] = true;
+                    --not_closed;
+                }
+            });
+        } while (!received && not_closed > 0 && (!f || not_visited > 0));
+        if (!received && f)
+            ctn = f();
+    }
+}
 
 using time_point = std::chrono::time_point<std::chrono::system_clock>;
 
 template <typename T, typename U>
-receiver<time_point> timer(const std::chrono::duration<T, U> &period) {
+receiver<time_point> after(const std::chrono::duration<T, U> &period) {
     chan<time_point> channel;
     std::thread th([=]() mutable {
         std::this_thread::sleep_for(period);
@@ -277,14 +256,14 @@ receiver<time_point> timer(const std::chrono::duration<T, U> &period) {
 }
 
 template <typename T, typename U>
-receiver<time_point> ticker(const std::chrono::duration<T, U> &interval) {
+receiver<time_point> tick(const std::chrono::duration<T, U> &interval) {
     chan<time_point> channel;
     std::thread th([=]() mutable {
         while (true) {
             std::this_thread::sleep_for(interval);
             try {
                 channel.send(std::chrono::system_clock::now());
-            } catch (const std::runtime_error &) {
+            } catch (const channel_error &) {
                 break;
             }
         }

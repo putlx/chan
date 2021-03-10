@@ -2,64 +2,82 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
-#include <ctime>
 #include <iostream>
 #include <string>
 #include <thread>
-using namespace channel;
 
 static constexpr int size = 16;
 
-void worker(int n, sender<int> channel, sender<std::string> logger, receiver<bool> quit,
-            sender<int> exit) {
-    channel << n;
+void worker(int n, channel::sender<int> pipe, channel::sender<std::string> logger,
+            channel::receiver<int> close, channel::sender<int> quit) {
+    pipe << n;
     logger << "send " + std::to_string(n);
-    assert(quit.receive());
-    exit << n;
-    logger << "worker " + std::to_string(n) + " exit";
+    assert(close.receive());
+    quit << n;
+    logger << "worker " + std::to_string(n) + " exits";
 }
 
 int main() {
-    chan<int> channel(4);
-    chan<std::string> logger;
-    chan<bool> quit;
-    chan<int> exit;
+    channel::chan<int> pipe(4), close, quit;
+    channel::chan<std::string> logger;
     std::thread ths[size];
     for (auto n = 0; n < size; ++n)
-        ths[n] = std::thread(worker, n, channel, logger, quit, exit);
+        ths[n] = std::thread(worker, n, pipe, logger, close, quit);
 
-    auto tmr = timer(std::chrono::seconds(4));
-    auto clk = ticker(std::chrono::seconds(1));
     bool ns[size] = {false};
-    bool es[size] = {false};
-    for (auto [n, msg, e, tp, tk] :
-         select<int, std::string, int, time_point, time_point>(channel, logger, exit, tmr, clk)) {
-        if (n) {
-            assert(!ns[*n]);
-            std::this_thread::sleep_for(std::chrono::milliseconds(400));
-            ns[*n] = true;
-            logger << "receive " + std::to_string(*n);
-            quit << true;
-        } else if (msg) {
-            std::cout << *msg << std::endl;
-        } else if (e) {
-            assert(!es[*e]);
-            es[*e] = true;
-            ths[*e].join();
-            if (std::all_of(es, es + size, [](auto e) { return e; })) {
-                channel.close();
-                exit.close();
-                logger.close();
-                clk.close();
-            }
-        } else if (tp) {
-            auto tt = std::chrono::system_clock::to_time_t(*tp);
-            std::cout << "current time: " << std::ctime(&tt);
-        } else if (tk) {
-            std::cout << "1 second passed" << std::endl;
-        }
-    }
+    bool qs[size] = {false};
+    auto ticker = channel::tick(std::chrono::seconds(1));
+    const auto start_time = std::chrono::system_clock::now();
 
-    assert(std::all_of(ns, ns + size, [](auto n) { return n; }));
+    channel::select<int, std::string, int, channel::time_point, channel::time_point>(
+        {pipe,
+         [&](int n) {
+             assert(!ns[n]);
+             logger << "receive " + std::to_string(n);
+             std::this_thread::sleep_for(std::chrono::milliseconds(400));
+             ns[n] = true;
+             close << 0;
+             return true;
+         }},
+
+        {logger,
+         [&](std::string msg) {
+             std::cout << msg << std::endl;
+             return true;
+         }},
+
+        {quit,
+         [&](int q) {
+             assert(!qs[q]);
+             qs[q] = true;
+             ths[q].join();
+             if (std::all_of(qs, qs + size, [](bool q) { return q; })) {
+                 pipe.close();
+                 logger.close();
+                 quit.close();
+                 ticker.close();
+             }
+             return true;
+         }},
+
+        {channel::after(std::chrono::seconds(4)),
+         [&](channel::time_point now) {
+             auto t = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+             std::cout << "after " << t << " seconds\n";
+             return true;
+         }},
+
+        {ticker,
+         [](channel::time_point) {
+             std::cout << "1 second passed\n";
+             return true;
+         }},
+
+        [] {
+            std::cout << "nothing to do\n";
+            return true;
+        });
+
+    assert(std::all_of(ns, ns + size, [](bool n) { return n; }));
     return 0;
 }
