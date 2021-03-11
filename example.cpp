@@ -8,21 +8,21 @@
 
 static constexpr int size = 16;
 
-void worker(int n, channel::sender<int> pipe, channel::sender<std::string> logger,
-            channel::receiver<int> close, channel::sender<int> quit) {
-    pipe << n;
+void worker(int n, channel::sender<int> chan, channel::sender<std::string> logger,
+            channel::receiver<int> quit, channel::sender<int> exit) {
+    chan << n;
     logger << "send " + std::to_string(n);
-    assert(close.receive());
-    quit << n;
+    assert(quit.receive());
+    exit << n;
     logger << "worker " + std::to_string(n) + " exits";
 }
 
 int main() {
-    channel::chan<int> pipe(4), close, quit;
+    channel::chan<int> chan(4), quit, exit;
     channel::chan<std::string> logger;
     std::thread ths[size];
     for (auto n = 0; n < size; ++n)
-        ths[n] = std::thread(worker, n, pipe, logger, close, quit);
+        ths[n] = std::thread(worker, n, chan, logger, quit, exit);
 
     bool ns[size] = {false};
     bool qs[size] = {false};
@@ -30,13 +30,13 @@ int main() {
     const auto start_time = std::chrono::system_clock::now();
 
     channel::select<int, std::string, int, channel::time_point, channel::time_point>(
-        {pipe,
+        {chan,
          [&](int n) {
              assert(!ns[n]);
              logger << "receive " + std::to_string(n);
              std::this_thread::sleep_for(std::chrono::milliseconds(400));
              ns[n] = true;
-             close << 0;
+             quit << 0;
              return true;
          }},
 
@@ -46,21 +46,21 @@ int main() {
              return true;
          }},
 
-        {quit,
+        {exit,
          [&](int q) {
              assert(!qs[q]);
              qs[q] = true;
              ths[q].join();
              if (std::all_of(qs, qs + size, [](bool q) { return q; })) {
-                 pipe.close();
+                 chan.close();
                  logger.close();
-                 quit.close();
+                 exit.close();
                  ticker.close();
              }
              return true;
          }},
 
-        {channel::after(std::chrono::seconds(4)),
+        {channel::after(std::chrono::seconds(4), [&] { logger << "hello"; }),
          [&](channel::time_point now) {
              auto t = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
              std::cout << "after " << t << " seconds\n";

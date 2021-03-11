@@ -244,11 +244,18 @@ void select(std::pair<receiver<Ts>, std::function<bool(Ts)>>... rfs,
 using time_point = std::chrono::time_point<std::chrono::system_clock>;
 
 template <typename T, typename U>
-receiver<time_point> after(const std::chrono::duration<T, U> &period) {
+receiver<time_point> after(const std::chrono::duration<T, U> &period,
+                           std::function<void()> f = std::function<void()>()) {
     chan<time_point> channel;
     std::thread th([=]() mutable {
         std::this_thread::sleep_for(period);
-        channel.send(std::chrono::system_clock::now());
+        try {
+            channel.send(std::chrono::system_clock::now());
+        } catch (const channel_error &) {
+            return;
+        }
+        if (f)
+            f();
         channel.close();
     });
     th.detach();
